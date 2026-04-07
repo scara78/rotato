@@ -4,6 +4,7 @@
   "main": "index.js",
   "scripts": {
     "start": "node index.js",
+    "dev": "node index.js",
     "test": "node tests/run-tests.js",
     "test:gemini": "node tests/test-gemini.js",
     "test:openai": "node tests/test-openai.js"
