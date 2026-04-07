@@ -1,8 +1,10 @@
 const http = require('http');
+const https = require('https');
 const { URL } = require('url');
 const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
+const { openaiToGemini, geminiToOpenai, convertStreamChunk, buildGeminiUrl } = require('./geminiTranslator');
 
 class ProxyServer {
   constructor(config, geminiClient = null, openaiClient = null) {
@@ -38,7 +40,6 @@ class ProxyServer {
         console.log(`Provider '${providerName}' (${config.apiType}): /${providerName}/* → ${config.baseUrl}`);
       }
       
-      // Backward compatibility logging
       if (this.config.hasGeminiKeys()) {
         console.log(`Legacy Gemini endpoints: /gemini/*`);
       }
@@ -48,6 +49,7 @@ class ProxyServer {
       
       if (this.config.hasAdminPassword()) {
         console.log(`Admin panel available at: http://localhost:${this.config.getPort()}/admin`);
+        console.log(`OpenAI-compatible Gemini endpoint: http://localhost:${this.config.getPort()}/v1/chat/completions`);
       }
     });
 
@@ -61,133 +63,115 @@ class ProxyServer {
     const clientIp = req.headers['x-forwarded-for'] || req.connection.remoteAddress;
     const startTime = Date.now();
 
-    // Set CORS headers for all responses - accept all origins
+    // Set CORS headers for all responses
     res.setHeader('Access-Control-Allow-Origin', '*');
     res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, PATCH, OPTIONS');
     res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-Requested-With, Accept, Origin');
-    res.setHeader('Access-Control-Max-Age', '86400'); // Cache preflight for 24 hours
+    res.setHeader('Access-Control-Max-Age', '86400');
 
-    // Handle preflight OPTIONS requests
     if (req.method === 'OPTIONS') {
       res.writeHead(204);
       res.end();
       return;
     }
 
-    // Only log to file for API calls, always log to console
-    const isApiCall = this.parseRoute(req.url) !== null;
+    const isApiCall = this.parseRoute(req.url) !== null || req.url.startsWith('/v1/');
     console.log(`[REQ-${requestId}] ${req.method} ${req.url} from ${clientIp}`);
 
     try {
       const body = await this.readRequestBody(req);
 
-      // Serve static files from public directory
+      // Serve static files
       if (req.url === '/tailwind-3.4.17.js' && (req.method === 'GET' || req.method === 'HEAD')) {
         try {
           const filePath = path.join(process.cwd(), 'public', 'tailwind-3.4.17.js');
-          console.log(`[STATIC] Serving file from: ${filePath}`);
-
           if (req.method === 'HEAD') {
-            // For HEAD requests, just send headers without body
             const stats = fs.statSync(filePath);
-            res.writeHead(200, {
-              'Content-Type': 'application/javascript',
-              'Content-Length': stats.size,
-              'Cache-Control': 'public, max-age=31536000' // Cache for 1 year
-            });
+            res.writeHead(200, { 'Content-Type': 'application/javascript', 'Content-Length': stats.size, 'Cache-Control': 'public, max-age=31536000' });
             res.end();
           } else {
-            // For GET requests, send the file content
             const fileContent = fs.readFileSync(filePath, 'utf8');
-            res.writeHead(200, {
-              'Content-Type': 'application/javascript',
-              'Content-Length': Buffer.byteLength(fileContent),
-              'Cache-Control': 'public, max-age=31536000' // Cache for 1 year
-            });
+            res.writeHead(200, { 'Content-Type': 'application/javascript', 'Content-Length': Buffer.byteLength(fileContent), 'Cache-Control': 'public, max-age=31536000' });
             res.end(fileContent);
           }
-          console.log(`[STATIC] Successfully served: ${req.url}`);
           return;
         } catch (error) {
-          console.log(`[STATIC] Error serving file: ${error.message}`);
           res.writeHead(404, { 'Content-Type': 'text/plain' });
           res.end('File not found');
           return;
         }
       }
 
-      // Handle root route - redirect to admin
+      // Root redirect
       if (req.url === '/' || req.url === '') {
         res.writeHead(302, { 'Location': '/admin' });
         res.end();
         return;
       }
 
-      // Handle admin routes
+      // Admin routes
       if (req.url.startsWith('/admin')) {
         await this.handleAdminRequest(req, res, body);
         return;
       }
 
-      // Handle common browser requests that aren't API calls
+      // Favicon / robots
       if (req.url === '/favicon.ico' || req.url === '/robots.txt') {
         res.writeHead(404, { 'Content-Type': 'text/plain' });
         res.end('Not found');
         return;
       }
-      
+
+      // ── OpenAI-compatible Gemini endpoints ──────────────────────────────────
+      // GET /v1/models  — list available Gemini models
+      if (req.url === '/v1/models' && req.method === 'GET') {
+        await this.handleOpenAIModels(req, res, requestId, startTime, clientIp);
+        return;
+      }
+
+      // POST /v1/chat/completions  — translate and proxy to Gemini
+      if (req.url === '/v1/chat/completions' && req.method === 'POST') {
+        await this.handleOpenAIChatCompletions(req, res, body, requestId, startTime, clientIp);
+        return;
+      }
+      // ────────────────────────────────────────────────────────────────────────
+
       const routeInfo = this.parseRoute(req.url);
       
       if (!routeInfo) {
         console.log(`[REQ-${requestId}] Invalid path: ${req.url}`);
-        console.log(`[REQ-${requestId}] Response: 400 Bad Request - Invalid API path`);
-        
-        if (isApiCall) {
-          const responseTime = Date.now() - startTime;
-          this.logApiRequest(requestId, req.method, req.url, 'unknown', 400, responseTime, 'Invalid API path', clientIp);
-        }
-        
-        this.sendError(res, 400, 'Invalid API path. Use /{provider}/* format');
+        const responseTime = Date.now() - startTime;
+        this.logApiRequest(requestId, req.method, req.url, 'unknown', 400, responseTime, 'Invalid API path', clientIp);
+        this.sendError(res, 400, 'Invalid API path. Use /{provider}/* or /v1/chat/completions format');
         return;
       }
 
-      const { providerName, apiType, path, provider, legacy } = routeInfo;
+      const { providerName, apiType, path: apiPath, provider, legacy } = routeInfo;
 
-      // Check if provider is disabled
       if (provider && provider.disabled) {
         console.log(`[REQ-${requestId}] Provider '${providerName}' is disabled`);
-        if (isApiCall) {
-          const responseTime = Date.now() - startTime;
-          this.logApiRequest(requestId, req.method, path, providerName, 503, responseTime, `Provider '${providerName}' is disabled`, clientIp);
-        }
+        const responseTime = Date.now() - startTime;
+        this.logApiRequest(requestId, req.method, apiPath, providerName, 503, responseTime, `Provider '${providerName}' is disabled`, clientIp);
         this.sendError(res, 503, `Provider '${providerName}' is currently disabled`);
         return;
       }
 
-      console.log(`[REQ-${requestId}] Proxying to provider '${providerName}' (${apiType.toUpperCase()}): ${path}`);
+      console.log(`[REQ-${requestId}] Proxying to provider '${providerName}' (${apiType.toUpperCase()}): ${apiPath}`);
 
-      // Get the appropriate header based on API type
       const authHeader = apiType === 'gemini'
         ? req.headers['x-goog-api-key']
         : req.headers['authorization'];
 
-      // Parse custom status codes and access key from header
       const customStatusCodes = this.parseStatusCodesFromAuth(authHeader);
 
-      // Validate ACCESS_KEY for this provider
       if (!this.validateAccessKey(providerName, authHeader)) {
         console.log(`[REQ-${requestId}] Response: 401 Unauthorized - Invalid or missing ACCESS_KEY for provider '${providerName}'`);
-
-        if (isApiCall) {
-          const responseTime = Date.now() - startTime;
-          this.logApiRequest(requestId, req.method, path, providerName, 401, responseTime, 'Invalid or missing ACCESS_KEY', clientIp);
-        }
-
+        const responseTime = Date.now() - startTime;
+        this.logApiRequest(requestId, req.method, apiPath, providerName, 401, responseTime, 'Invalid or missing ACCESS_KEY', clientIp);
         this.sendError(res, 401, `Invalid or missing ACCESS_KEY for provider '${providerName}'`);
         return;
       }
       
-      // Clean the auth header before passing to API
       const headers = this.extractRelevantHeaders(req.headers, apiType);
       if (authHeader) {
         const cleanedAuth = this.cleanAuthHeader(authHeader);
@@ -198,49 +182,34 @@ class ProxyServer {
             headers['authorization'] = cleanedAuth;
           }
         }
-        // Important: don't set undefined/null as it would override the client's API key
       }
 
-      let response;
-
-      // Get or create client for this provider
       const client = await this.getProviderClient(providerName, provider, legacy);
       if (!client) {
         console.log(`[REQ-${requestId}] Response: 503 Service Unavailable - Provider '${providerName}' not configured`);
-
-        if (isApiCall) {
-          const responseTime = Date.now() - startTime;
-          this.logApiRequest(requestId, req.method, path, providerName, 503, responseTime, `Provider '${providerName}' not configured`, clientIp);
-        }
-
+        const responseTime = Date.now() - startTime;
+        this.logApiRequest(requestId, req.method, apiPath, providerName, 503, responseTime, `Provider '${providerName}' not configured`, clientIp);
         this.sendError(res, 503, `Provider '${providerName}' not configured`);
         return;
       }
 
-      // Pass custom status codes to client if provided
       if (customStatusCodes) {
         console.log(`[REQ-${requestId}] Using custom status codes for rotation: ${Array.from(customStatusCodes).join(', ')}`);
       }
 
-      // Detect streaming request
       const isStreaming = this.isStreamingRequest(body);
       if (isStreaming) {
         console.log(`[REQ-${requestId}] Streaming request detected`);
       }
 
-      response = await client.makeRequest(req.method, path, body, headers, customStatusCodes, isStreaming);
-
-      // Extract key info from response
+      const response = await client.makeRequest(req.method, apiPath, body, headers, customStatusCodes, isStreaming);
       const keyInfo = response._keyInfo || null;
 
       if (isStreaming && response.stream) {
-        // Streaming response - pipe directly to client
         const streamHeaders = { ...response.headers };
         streamHeaders['access-control-allow-origin'] = '*';
-
         res.writeHead(response.statusCode, streamHeaders);
 
-        // Collect streamed chunks while piping to client (cap at 512KB to avoid memory issues)
         const MAX_CAPTURE = 512 * 1024;
         const streamChunks = [];
         let capturedSize = 0;
@@ -249,11 +218,8 @@ class ProxyServer {
         response.stream.on('data', (chunk) => {
           if (!truncated) {
             capturedSize += chunk.length;
-            if (capturedSize <= MAX_CAPTURE) {
-              streamChunks.push(chunk);
-            } else {
-              truncated = true;
-            }
+            if (capturedSize <= MAX_CAPTURE) streamChunks.push(chunk);
+            else truncated = true;
           }
         });
 
@@ -261,71 +227,284 @@ class ProxyServer {
 
         response.stream.on('end', () => {
           let streamedData = Buffer.concat(streamChunks).toString('utf8');
-          if (truncated) {
-            streamedData += `\n\n[... truncated at 512KB — total streamed: ${(capturedSize / 1024).toFixed(1)}KB]`;
-          }
+          if (truncated) streamedData += `\n\n[... truncated at 512KB — total streamed: ${(capturedSize / 1024).toFixed(1)}KB]`;
           this.storeResponseData(requestId, {
-            method: req.method,
-            endpoint: path,
-            apiType: apiType.toUpperCase(),
-            status: response.statusCode,
-            statusText: this.getStatusText(response.statusCode),
+            method: req.method, endpoint: apiPath, apiType: apiType.toUpperCase(),
+            status: response.statusCode, statusText: this.getStatusText(response.statusCode),
             contentType: response.headers['content-type'] || 'text/event-stream',
-            responseData: streamedData,
-            requestBody: body,
-            streaming: true,
-            keyInfo: keyInfo
+            responseData: streamedData, requestBody: body, streaming: true, keyInfo
           });
-
-          if (isApiCall) {
-            const responseTime = Date.now() - startTime;
-            const error = response.statusCode >= 400 ? `HTTP ${response.statusCode}` : null;
-            this.logApiRequest(requestId, req.method, path, providerName, response.statusCode, responseTime, error, clientIp, keyInfo);
-          }
+          const responseTime = Date.now() - startTime;
+          const error = response.statusCode >= 400 ? `HTTP ${response.statusCode}` : null;
+          this.logApiRequest(requestId, req.method, apiPath, providerName, response.statusCode, responseTime, error, clientIp, keyInfo);
           console.log(`[REQ-${requestId}] Streaming response completed`);
         });
 
         response.stream.on('error', (err) => {
           console.log(`[REQ-${requestId}] Streaming error: ${err.message}`);
-          if (!res.headersSent) {
-            this.sendError(res, 502, 'Streaming error');
-          }
+          if (!res.headersSent) this.sendError(res, 502, 'Streaming error');
         });
       } else {
-        // Non-streaming response
-        if (isApiCall) {
-          const responseTime = Date.now() - startTime;
-          const error = response.statusCode >= 400 ? `HTTP ${response.statusCode}` : null;
-          this.logApiRequest(requestId, req.method, path, providerName, response.statusCode, responseTime, error, clientIp, keyInfo);
-        }
-
+        const responseTime = Date.now() - startTime;
+        const error = response.statusCode >= 400 ? `HTTP ${response.statusCode}` : null;
+        this.logApiRequest(requestId, req.method, apiPath, providerName, response.statusCode, responseTime, error, clientIp, keyInfo);
         this.logApiResponse(requestId, response, body);
         this.sendResponse(res, response);
       }
     } catch (error) {
       console.log(`[REQ-${requestId}] Request handling error: ${error.message}`);
-      console.log(`[REQ-${requestId}] Response: 500 Internal Server Error`);
-      
-      if (isApiCall) {
-        const responseTime = Date.now() - startTime;
-        this.logApiRequest(requestId, req.method, req.url, 'unknown', 500, responseTime, error.message, clientIp);
-      }
-      
+      const responseTime = Date.now() - startTime;
+      this.logApiRequest(requestId, req.method, req.url, 'unknown', 500, responseTime, error.message, clientIp);
       this.sendError(res, 500, 'Internal server error');
     }
   }
 
+  // ── OpenAI-compatible Gemini handlers ──────────────────────────────────────
+
+  /**
+   * Pick the best Gemini provider from configured providers.
+   * Returns { provider, providerName, client } or null.
+   */
+  async _getBestGeminiProvider() {
+    const providers = this.config.getProviders();
+    for (const [providerName, provider] of providers.entries()) {
+      if (provider.apiType === 'gemini' && !provider.disabled && provider.keys.length > 0) {
+        const client = await this.getProviderClient(providerName, provider, false);
+        if (client) return { provider, providerName, client };
+      }
+    }
+    // Fallback to legacy gemini client
+    if (this.geminiClient) {
+      return { provider: null, providerName: 'gemini', client: this.geminiClient };
+    }
+    return null;
+  }
+
+  /**
+   * GET /v1/models — return list of Gemini models in OpenAI format
+   */
+  async handleOpenAIModels(req, res, requestId, startTime, clientIp) {
+    const best = await this._getBestGeminiProvider();
+    if (!best) {
+      this.logApiRequest(requestId, 'GET', '/v1/models', 'gemini-openai-compat', 503, Date.now() - startTime, 'No Gemini provider configured', clientIp);
+      this.sendError(res, 503, 'No Gemini provider configured. Add a Gemini provider in the admin panel.');
+      return;
+    }
+
+    const { provider, providerName, client } = best;
+    const baseUrl = (provider && provider.baseUrl) || 'https://generativelanguage.googleapis.com/v1';
+
+    // Validate access key if configured
+    const authHeader = req.headers['authorization'];
+    if (!this.validateAccessKey(providerName, authHeader)) {
+      this.sendError(res, 401, 'Invalid or missing ACCESS_KEY');
+      return;
+    }
+
+    try {
+      const geminiResp = await client.makeRequest('GET', '/models', null, {}, null, false);
+      let models = [];
+      try {
+        const parsed = JSON.parse(geminiResp.data);
+        models = (parsed.models || []).map(m => ({
+          id: m.name.replace('models/', ''),
+          object: 'model',
+          created: Math.floor(Date.now() / 1000),
+          owned_by: 'google'
+        }));
+      } catch (e) {
+        // If parsing fails, return a sensible default list
+        models = [
+          { id: 'gemini-2.0-flash', object: 'model', created: Math.floor(Date.now() / 1000), owned_by: 'google' },
+          { id: 'gemini-1.5-pro', object: 'model', created: Math.floor(Date.now() / 1000), owned_by: 'google' },
+          { id: 'gemini-1.5-flash', object: 'model', created: Math.floor(Date.now() / 1000), owned_by: 'google' }
+        ];
+      }
+
+      const openaiResponse = { object: 'list', data: models };
+      this.logApiRequest(requestId, 'GET', '/v1/models', 'gemini-openai-compat', 200, Date.now() - startTime, null, clientIp);
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify(openaiResponse));
+    } catch (err) {
+      this.logApiRequest(requestId, 'GET', '/v1/models', 'gemini-openai-compat', 500, Date.now() - startTime, err.message, clientIp);
+      this.sendError(res, 500, 'Failed to fetch models from Gemini: ' + err.message);
+    }
+  }
+
+  /**
+   * POST /v1/chat/completions — translate OpenAI request → Gemini → translate back
+   */
+  async handleOpenAIChatCompletions(req, res, body, requestId, startTime, clientIp) {
+    const best = await this._getBestGeminiProvider();
+    if (!best) {
+      this.logApiRequest(requestId, 'POST', '/v1/chat/completions', 'gemini-openai-compat', 503, Date.now() - startTime, 'No Gemini provider configured', clientIp);
+      this.sendError(res, 503, 'No Gemini provider configured. Add a Gemini provider in the admin panel.');
+      return;
+    }
+
+    const { provider, providerName, client } = best;
+
+    // Validate access key if configured
+    const authHeader = req.headers['authorization'];
+    if (!this.validateAccessKey(providerName, authHeader)) {
+      this.sendError(res, 401, 'Invalid or missing ACCESS_KEY');
+      return;
+    }
+
+    let openaiBody;
+    try {
+      openaiBody = JSON.parse(body);
+    } catch (e) {
+      this.sendError(res, 400, 'Invalid JSON body');
+      return;
+    }
+
+    const streaming = openaiBody.stream === true;
+    const { geminiBody, model } = openaiToGemini(openaiBody);
+    const baseUrl = (provider && provider.baseUrl) || 'https://generativelanguage.googleapis.com/v1';
+
+    // Build the Gemini path: /models/{model}:generateContent or :streamGenerateContent
+    const action = streaming ? 'streamGenerateContent?alt=sse' : 'generateContent';
+    const geminiPath = `/models/${model}:${action}`;
+
+    console.log(`[REQ-${requestId}] OpenAI→Gemini translation: model=${model}, streaming=${streaming}`);
+
+    try {
+      if (streaming) {
+        // Streaming: pipe Gemini SSE → translate each chunk → emit OpenAI SSE
+        const geminiResp = await client.makeRequest('POST', geminiPath, JSON.stringify(geminiBody), { 'content-type': 'application/json' }, null, true);
+        const keyInfo = geminiResp._keyInfo || null;
+
+        if (geminiResp.statusCode >= 400) {
+          // Read error body from stream
+          let errData = '';
+          geminiResp.stream.on('data', c => { errData += c; });
+          geminiResp.stream.on('end', () => {
+            this.logApiRequest(requestId, 'POST', '/v1/chat/completions', 'gemini-openai-compat', geminiResp.statusCode, Date.now() - startTime, errData, clientIp, keyInfo);
+            res.writeHead(geminiResp.statusCode, { 'Content-Type': 'application/json' });
+            res.end(errData);
+          });
+          return;
+        }
+
+        res.writeHead(200, {
+          'Content-Type': 'text/event-stream',
+          'Cache-Control': 'no-cache',
+          'Connection': 'keep-alive',
+          'Access-Control-Allow-Origin': '*'
+        });
+
+        let buffer = '';
+        const capturedChunks = [];
+
+        geminiResp.stream.on('data', (chunk) => {
+          buffer += chunk.toString('utf8');
+          // Process complete SSE lines
+          const lines = buffer.split('\n');
+          buffer = lines.pop(); // keep incomplete last line
+
+          for (const line of lines) {
+            const trimmed = line.trim();
+            if (!trimmed) continue;
+
+            // Gemini SSE lines look like: "data: {...}"
+            if (trimmed.startsWith('data:')) {
+              const jsonStr = trimmed.slice(5).trim();
+              if (jsonStr === '[DONE]') {
+                res.write('data: [DONE]\n\n');
+                continue;
+              }
+              try {
+                const parsed = JSON.parse(jsonStr);
+                const openaiChunk = geminiToOpenai(parsed, model, true);
+                const sseChunk = `data: ${JSON.stringify(openaiChunk)}\n\n`;
+                res.write(sseChunk);
+                capturedChunks.push(sseChunk);
+              } catch (e) {
+                // skip unparseable chunk
+              }
+            }
+          }
+        });
+
+        geminiResp.stream.on('end', () => {
+          // Flush remaining buffer
+          if (buffer.trim()) {
+            const trimmed = buffer.trim();
+            if (trimmed.startsWith('data:')) {
+              const jsonStr = trimmed.slice(5).trim();
+              try {
+                const parsed = JSON.parse(jsonStr);
+                const openaiChunk = geminiToOpenai(parsed, model, true);
+                res.write(`data: ${JSON.stringify(openaiChunk)}\n\n`);
+              } catch (e) {}
+            }
+          }
+          res.write('data: [DONE]\n\n');
+          res.end();
+
+          this.storeResponseData(requestId, {
+            method: 'POST', endpoint: '/v1/chat/completions', apiType: 'Gemini→OpenAI',
+            status: 200, statusText: 'OK', contentType: 'text/event-stream',
+            responseData: capturedChunks.join(''), requestBody: body, streaming: true, keyInfo
+          });
+          this.logApiRequest(requestId, 'POST', '/v1/chat/completions', 'gemini-openai-compat', 200, Date.now() - startTime, null, clientIp, keyInfo);
+        });
+
+        geminiResp.stream.on('error', (err) => {
+          console.log(`[REQ-${requestId}] Gemini stream error: ${err.message}`);
+          res.end();
+        });
+
+      } else {
+        // Non-streaming
+        const geminiResp = await client.makeRequest('POST', geminiPath, JSON.stringify(geminiBody), { 'content-type': 'application/json' }, null, false);
+        const keyInfo = geminiResp._keyInfo || null;
+        const responseTime = Date.now() - startTime;
+
+        if (geminiResp.statusCode >= 400) {
+          this.logApiRequest(requestId, 'POST', '/v1/chat/completions', 'gemini-openai-compat', geminiResp.statusCode, responseTime, `HTTP ${geminiResp.statusCode}`, clientIp, keyInfo);
+          res.writeHead(geminiResp.statusCode, { 'Content-Type': 'application/json' });
+          res.end(geminiResp.data);
+          return;
+        }
+
+        let geminiParsed;
+        try {
+          geminiParsed = JSON.parse(geminiResp.data);
+        } catch (e) {
+          this.logApiRequest(requestId, 'POST', '/v1/chat/completions', 'gemini-openai-compat', 502, responseTime, 'Invalid JSON from Gemini', clientIp, keyInfo);
+          this.sendError(res, 502, 'Invalid response from Gemini API');
+          return;
+        }
+
+        const openaiResponse = geminiToOpenai(geminiParsed, model, false);
+
+        this.storeResponseData(requestId, {
+          method: 'POST', endpoint: '/v1/chat/completions', apiType: 'Gemini→OpenAI',
+          status: 200, statusText: 'OK', contentType: 'application/json',
+          responseData: JSON.stringify(openaiResponse), requestBody: body, streaming: false, keyInfo
+        });
+        this.logApiRequest(requestId, 'POST', '/v1/chat/completions', 'gemini-openai-compat', 200, responseTime, null, clientIp, keyInfo);
+
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify(openaiResponse));
+      }
+    } catch (err) {
+      const responseTime = Date.now() - startTime;
+      console.log(`[REQ-${requestId}] OpenAI-compat handler error: ${err.message}`);
+      this.logApiRequest(requestId, 'POST', '/v1/chat/completions', 'gemini-openai-compat', 500, responseTime, err.message, clientIp);
+      this.sendError(res, 500, 'Internal error: ' + err.message);
+    }
+  }
+
+  // ── Existing methods (unchanged) ───────────────────────────────────────────
+
   readRequestBody(req) {
     return new Promise((resolve) => {
       let body = '';
-      
-      req.on('data', (chunk) => {
-        body += chunk;
-      });
-      
-      req.on('end', () => {
-        resolve(body || null);
-      });
+      req.on('data', (chunk) => { body += chunk; });
+      req.on('end', () => { resolve(body || null); });
     });
   }
 
@@ -333,80 +512,45 @@ class ProxyServer {
     if (!url) return null;
     
     const urlObj = new URL(url, 'http://localhost');
-    const path = urlObj.pathname;
+    const urlPath = urlObj.pathname;
     
-    // Parse new provider format: /{provider}/* (no version required)
-    const pathParts = path.split('/').filter(part => part.length > 0);
+    const pathParts = urlPath.split('/').filter(part => part.length > 0);
     if (pathParts.length >= 1) {
       const providerName = pathParts[0].toLowerCase();
       const provider = this.config.getProvider(providerName);
 
       if (provider) {
-        // Extract the API path after /{provider}
         const apiPath = '/' + pathParts.slice(1).join('/') + urlObj.search;
-
-        return {
-          providerName: providerName,
-          apiType: provider.apiType,
-          path: apiPath, // Use path as-is, no adjustment needed
-          provider: provider
-        };
+        return { providerName, apiType: provider.apiType, path: apiPath, provider };
       }
     }
     
-    // Backward compatibility - Legacy Gemini routes: /gemini/*
-    if (path.startsWith('/gemini/')) {
-      const geminiPath = path.substring(7); // Remove '/gemini'
-
-      return {
-        providerName: 'gemini',
-        apiType: 'gemini',
-        path: geminiPath + urlObj.search,
-        legacy: true
-      };
+    if (urlPath.startsWith('/gemini/')) {
+      const geminiPath = urlPath.substring(7);
+      return { providerName: 'gemini', apiType: 'gemini', path: geminiPath + urlObj.search, legacy: true };
     }
     
-    // Backward compatibility - Legacy OpenAI routes: /openai/*
-    if (path.startsWith('/openai/')) {
-      const openaiPath = path.substring(7); // Remove '/openai'
-
-      return {
-        providerName: 'openai',
-        apiType: 'openai',
-        path: openaiPath + urlObj.search,
-        legacy: true
-      };
+    if (urlPath.startsWith('/openai/')) {
+      const openaiPath = urlPath.substring(7);
+      return { providerName: 'openai', apiType: 'openai', path: openaiPath + urlObj.search, legacy: true };
     }
     
     return null;
   }
 
-
   async getProviderClient(providerName, provider, legacy = false) {
-    // Handle legacy clients
     if (legacy) {
-      if (providerName === 'gemini' && this.geminiClient) {
-        return this.geminiClient;
-      }
-      if (providerName === 'openai' && this.openaiClient) {
-        return this.openaiClient;
-      }
+      if (providerName === 'gemini' && this.geminiClient) return this.geminiClient;
+      if (providerName === 'openai' && this.openaiClient) return this.openaiClient;
       return null;
     }
 
-    // Check if we already have a client for this provider
-    if (this.providerClients.has(providerName)) {
-      return this.providerClients.get(providerName);
-    }
+    if (this.providerClients.has(providerName)) return this.providerClients.get(providerName);
 
-    // Create new client for this provider
-    if (!provider) {
-      return null;
-    }
+    if (!provider) return null;
 
     try {
-      // Use only enabled keys for rotation
-      const enabledKeys = provider.keys; // Already filtered by config parser
+      const enabledKeys = provider.keys;
       if (enabledKeys.length === 0) {
         console.log(`[SERVER] Provider '${providerName}' has no enabled keys`);
         return null;
@@ -432,49 +576,28 @@ class ProxyServer {
   }
 
   parseStatusCodesFromAuth(authHeader) {
-    // Extract [STATUS_CODES:...] from the Authorization header
     const match = authHeader?.match(/\[STATUS_CODES:([^\]]+)\]/i);
     if (!match) return null;
 
     const statusCodeStr = match[1];
     const codes = new Set();
-
-    // Parse each part (e.g., "429", "400-420", "500+", "400=+")
     const parts = statusCodeStr.split(',').map(s => s.trim());
 
     for (const part of parts) {
       if (part.includes('-')) {
-        // Range: 400-420
         const [start, end] = part.split('-').map(n => parseInt(n.trim()));
         if (!isNaN(start) && !isNaN(end)) {
-          for (let i = start; i <= end; i++) {
-            codes.add(i);
-          }
+          for (let i = start; i <= end; i++) codes.add(i);
         }
       } else if (part.endsWith('=+')) {
-        // Equal or greater: 400=+
         const base = parseInt(part.slice(0, -2).trim());
-        if (!isNaN(base)) {
-          // Add codes from base to 599 (reasonable upper limit for HTTP status codes)
-          for (let i = base; i <= 599; i++) {
-            codes.add(i);
-          }
-        }
+        if (!isNaN(base)) for (let i = base; i <= 599; i++) codes.add(i);
       } else if (part.endsWith('+')) {
-        // Greater than: 400+
         const base = parseInt(part.slice(0, -1).trim());
-        if (!isNaN(base)) {
-          // Add codes from base+1 to 599
-          for (let i = base + 1; i <= 599; i++) {
-            codes.add(i);
-          }
-        }
+        if (!isNaN(base)) for (let i = base + 1; i <= 599; i++) codes.add(i);
       } else {
-        // Single code: 429
         const code = parseInt(part.trim());
-        if (!isNaN(code)) {
-          codes.add(code);
-        }
+        if (!isNaN(code)) codes.add(code);
       }
     }
 
@@ -482,7 +605,6 @@ class ProxyServer {
   }
 
   parseAccessKeyFromAuth(authHeader) {
-    // Extract [ACCESS_KEY:...] from the Authorization header
     const match = authHeader?.match(/\[ACCESS_KEY:([^\]]+)\]/i);
     if (!match) return null;
     return match[1].trim();
@@ -490,34 +612,21 @@ class ProxyServer {
 
   validateAccessKey(provider, authHeader) {
     const providerConfig = this.config.getProvider(provider);
-    if (!providerConfig || !providerConfig.accessKey) {
-      // No access key required for this provider
-      return true;
-    }
+    if (!providerConfig || !providerConfig.accessKey) return true;
 
     const providedAccessKey = this.parseAccessKeyFromAuth(authHeader);
-    if (!providedAccessKey) {
-      return false;
-    }
+    if (!providedAccessKey) return false;
 
     return providedAccessKey === providerConfig.accessKey;
   }
 
   cleanAuthHeader(authHeader) {
-    // Remove [STATUS_CODES:...] and [ACCESS_KEY:...] from the auth header before passing to the actual API
     if (!authHeader) return authHeader;
-
     const cleaned = authHeader
       .replace(/\[STATUS_CODES:[^\]]+\]/gi, '')
       .replace(/\[ACCESS_KEY:[^\]]+\]/gi, '')
       .trim();
-
-    // If after cleaning we're left with just "Bearer" or "Bearer ", return null
-    // This allows the client to add its own API key
-    if (cleaned === 'Bearer' || cleaned === 'Bearer ') {
-      return null;
-    }
-
+    if (cleaned === 'Bearer' || cleaned === 'Bearer ') return null;
     return cleaned;
   }
 
@@ -526,27 +635,13 @@ class ProxyServer {
     let headersToInclude;
 
     if (apiType === 'gemini') {
-      headersToInclude = [
-        'content-type',
-        'accept',
-        'user-agent',
-        'x-goog-user-project'
-        // Don't include x-goog-api-key here - we handle it separately
-      ];
-    } else if (apiType === 'openai') {
-      headersToInclude = [
-        'content-type',
-        'accept',
-        'user-agent',
-        'openai-organization',
-        'openai-project'
-      ];
+      headersToInclude = ['content-type', 'accept', 'user-agent', 'x-goog-user-project'];
+    } else {
+      headersToInclude = ['content-type', 'accept', 'user-agent', 'openai-organization', 'openai-project'];
     }
 
     for (const [key, value] of Object.entries(headers)) {
-      if (headersToInclude.includes(key.toLowerCase())) {
-        relevantHeaders[key] = value;
-      }
+      if (headersToInclude.includes(key.toLowerCase())) relevantHeaders[key] = value;
     }
 
     return relevantHeaders;
@@ -559,7 +654,6 @@ class ProxyServer {
 
   sendError(res, statusCode, message) {
     console.log(`[SERVER] Sending error response: ${statusCode} - ${message}`);
-
     const errorResponse = {
       error: {
         code: statusCode,
@@ -567,14 +661,10 @@ class ProxyServer {
         status: statusCode === 400 ? 'INVALID_ARGUMENT' : 'INTERNAL'
       }
     };
-
     res.writeHead(statusCode, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify(errorResponse));
   }
 
-  /**
-   * Detect if a request body contains stream: true
-   */
   isStreamingRequest(body) {
     if (!body) return false;
     try {
@@ -589,91 +679,62 @@ class ProxyServer {
     const contentLength = response.headers['content-length'] || (response.data ? response.data.length : 0);
     const contentType = response.headers['content-type'] || 'unknown';
     
-    // Store response data for viewing
     this.storeResponseData(requestId, {
-      method: 'API_CALL',
-      endpoint: 'proxied_request',
-      apiType: 'LLM_API',
-      status: response.statusCode,
-      statusText: this.getStatusText(response.statusCode),
-      contentType: contentType,
-      responseData: response.data,
-      requestBody: requestBody
+      method: 'API_CALL', endpoint: 'proxied_request', apiType: 'LLM_API',
+      status: response.statusCode, statusText: this.getStatusText(response.statusCode),
+      contentType, responseData: response.data, requestBody
     });
     
-    // Log basic response info to console only (structured logging handled in handleRequest)
-    const responseMsg = `[REQ-${requestId}] Response: ${response.statusCode} ${this.getStatusText(response.statusCode)}`;
-    const contentMsg = `[REQ-${requestId}] Content-Type: ${contentType}, Size: ${contentLength} bytes`;
+    console.log(`[REQ-${requestId}] Response: ${response.statusCode} ${this.getStatusText(response.statusCode)}`);
+    console.log(`[REQ-${requestId}] Content-Type: ${contentType}, Size: ${contentLength} bytes`);
     
-    console.log(responseMsg);
-    console.log(contentMsg);
-    
-    // For error responses, log the error details to console
     if (response.statusCode >= 400) {
       try {
         const errorData = JSON.parse(response.data);
-        if (errorData.error) {
-          const errorMsg = `[REQ-${requestId}] Error: ${errorData.error.message || errorData.error.code || 'Unknown error'}`;
-          console.log(errorMsg);
-        }
+        if (errorData.error) console.log(`[REQ-${requestId}] Error: ${errorData.error.message || errorData.error.code || 'Unknown error'}`);
       } catch (e) {
-        // If response is not JSON, log first 200 chars of response
         const errorText = response.data ? response.data.toString().substring(0, 200) : 'No error details';
-        const errorMsg = `[REQ-${requestId}] Error details: ${errorText}`;
-        console.log(errorMsg);
+        console.log(`[REQ-${requestId}] Error details: ${errorText}`);
       }
     }
     
-    // For successful responses, log basic success info to console
     if (response.statusCode >= 200 && response.statusCode < 300) {
-      const successMsg = `[REQ-${requestId}] Request completed successfully`;
-      console.log(successMsg);
+      console.log(`[REQ-${requestId}] Request completed successfully`);
     }
   }
 
   getStatusText(statusCode) {
     const statusTexts = {
-      200: 'OK',
-      201: 'Created',
-      400: 'Bad Request',
-      401: 'Unauthorized',
-      403: 'Forbidden',
-      404: 'Not Found',
-      429: 'Too Many Requests',
-      500: 'Internal Server Error',
-      502: 'Bad Gateway',
-      503: 'Service Unavailable'
+      200: 'OK', 201: 'Created', 400: 'Bad Request', 401: 'Unauthorized',
+      403: 'Forbidden', 404: 'Not Found', 429: 'Too Many Requests',
+      500: 'Internal Server Error', 502: 'Bad Gateway', 503: 'Service Unavailable'
     };
     return statusTexts[statusCode] || 'Unknown Status';
   }
 
   async handleAdminRequest(req, res, body) {
     const url = new URL(req.url, 'http://localhost');
-    const path = url.pathname;
+    const urlPath = url.pathname;
     
-    // Check if admin password is configured
     const adminPassword = this.getAdminPassword();
     if (!adminPassword) {
       this.sendError(res, 503, 'Admin panel not configured');
       return;
     }
     
-    // Serve main admin page
-    if (path === '/admin' || path === '/admin/') {
+    if (urlPath === '/admin' || urlPath === '/admin/') {
       this.serveAdminPanel(res);
       return;
     }
     
-    // Check authentication status
-    if (path === '/admin/api/auth' && req.method === 'GET') {
+    if (urlPath === '/admin/api/auth' && req.method === 'GET') {
       const isAuthenticated = this.isAdminAuthenticated(req);
       res.writeHead(200, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ authenticated: isAuthenticated }));
       return;
     }
     
-    // Check login rate limit status
-    if (path === '/admin/api/login-status' && req.method === 'GET') {
+    if (urlPath === '/admin/api/login-status' && req.method === 'GET') {
       const now = Date.now();
       const isBlocked = this.loginBlockedUntil && now < this.loginBlockedUntil;
       res.writeHead(200, { 'Content-Type': 'application/json' });
@@ -686,14 +747,12 @@ class ProxyServer {
       return;
     }
 
-    // Handle login
-    if (path === '/admin/login' && req.method === 'POST') {
+    if (urlPath === '/admin/login' && req.method === 'POST') {
       await this.handleAdminLogin(req, res, body);
       return;
     }
     
-    // Handle logout
-    if (path === '/admin/logout' && req.method === 'POST') {
+    if (urlPath === '/admin/logout' && req.method === 'POST') {
       this.adminSessionToken = null;
       res.writeHead(200, { 
         'Content-Type': 'application/json',
@@ -703,33 +762,31 @@ class ProxyServer {
       return;
     }
     
-    // All other admin routes require authentication
     if (!this.isAdminAuthenticated(req)) {
       res.writeHead(401, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ error: 'Unauthorized' }));
       return;
     }
     
-    // Admin API routes
-    if (path === '/admin/api/env' && req.method === 'GET') {
+    if (urlPath === '/admin/api/env' && req.method === 'GET') {
       await this.handleGetEnvVars(res);
-    } else if (path === '/admin/api/env-file' && req.method === 'GET') {
+    } else if (urlPath === '/admin/api/env-file' && req.method === 'GET') {
       await this.handleGetEnvFile(res);
-    } else if (path === '/admin/api/env' && req.method === 'POST') {
+    } else if (urlPath === '/admin/api/env' && req.method === 'POST') {
       await this.handleUpdateEnvVars(res, body);
-    } else if (path === '/admin/api/test' && req.method === 'POST') {
+    } else if (urlPath === '/admin/api/test' && req.method === 'POST') {
       await this.handleTestApiKey(res, body);
-    } else if (path === '/admin/api/logs' && req.method === 'GET') {
+    } else if (urlPath === '/admin/api/logs' && req.method === 'GET') {
       await this.handleGetLogs(res);
-    } else if (path.startsWith('/admin/api/response/') && req.method === 'GET') {
-      await this.handleGetResponse(res, path);
-    } else if (path === '/admin/api/reorder-keys' && req.method === 'POST') {
+    } else if (urlPath.startsWith('/admin/api/response/') && req.method === 'GET') {
+      await this.handleGetResponse(res, urlPath);
+    } else if (urlPath === '/admin/api/reorder-keys' && req.method === 'POST') {
       await this.handleReorderKeys(res, body);
-    } else if (path === '/admin/api/key-usage' && req.method === 'GET') {
+    } else if (urlPath === '/admin/api/key-usage' && req.method === 'GET') {
       await this.handleGetKeyUsage(res);
-    } else if (path === '/admin/api/toggle-key' && req.method === 'POST') {
+    } else if (urlPath === '/admin/api/toggle-key' && req.method === 'POST') {
       await this.handleToggleKey(res, body);
-    } else if (path === '/admin/api/toggle-provider' && req.method === 'POST') {
+    } else if (urlPath === '/admin/api/toggle-provider' && req.method === 'POST') {
       await this.handleToggleProvider(res, body);
     } else {
       this.sendError(res, 404, 'Not found');
@@ -745,9 +802,7 @@ class ProxyServer {
     if (cookieHeader) {
       cookieHeader.split(';').forEach(cookie => {
         const parts = cookie.trim().split('=');
-        if (parts.length === 2) {
-          cookies[parts[0]] = parts[1];
-        }
+        if (parts.length === 2) cookies[parts[0]] = parts[1];
       });
     }
     return cookies;
@@ -760,7 +815,6 @@ class ProxyServer {
 
   async handleAdminLogin(req, res, body) {
     try {
-      // Check if login is currently blocked
       if (this.loginBlockedUntil && Date.now() < this.loginBlockedUntil) {
         const remainingSeconds = Math.ceil((this.loginBlockedUntil - Date.now()) / 1000);
         const remainingMinutes = Math.ceil(remainingSeconds / 60);
@@ -768,7 +822,7 @@ class ProxyServer {
         res.end(JSON.stringify({
           error: `Too many failed login attempts. Please wait ${remainingMinutes} minute(s).`,
           blockedUntil: this.loginBlockedUntil,
-          remainingSeconds: remainingSeconds
+          remainingSeconds
         }));
         return;
       }
@@ -777,12 +831,9 @@ class ProxyServer {
       const adminPassword = this.getAdminPassword();
 
       if (data.password === adminPassword) {
-        // Successful login - reset counters
         this.failedLoginAttempts = 0;
         this.loginBlockedUntil = null;
         this.adminSessionToken = this.generateSessionToken();
-
-        // Set session cookie (expires in 24 hours)
         const expires = new Date(Date.now() + 24 * 60 * 60 * 1000).toUTCString();
         res.writeHead(200, {
           'Content-Type': 'application/json',
@@ -790,27 +841,17 @@ class ProxyServer {
         });
         res.end(JSON.stringify({ success: true }));
       } else {
-        // Failed login - increment counter
         this.failedLoginAttempts++;
         const attemptsRemaining = 5 - this.failedLoginAttempts;
-
-        // Block if reached 5 attempts
         if (this.failedLoginAttempts >= 5) {
-          this.loginBlockedUntil = Date.now() + (5 * 60 * 1000); // 5 minutes
-          console.log('[SECURITY] Login blocked due to 5 failed attempts. Blocked until:', new Date(this.loginBlockedUntil).toISOString());
+          this.loginBlockedUntil = Date.now() + (5 * 60 * 1000);
+          console.log('[SECURITY] Login blocked due to 5 failed attempts.');
           res.writeHead(429, { 'Content-Type': 'application/json' });
-          res.end(JSON.stringify({
-            error: 'Too many failed login attempts. Please wait 5 minutes.',
-            blockedUntil: this.loginBlockedUntil,
-            remainingSeconds: 300
-          }));
+          res.end(JSON.stringify({ error: 'Too many failed login attempts. Please wait 5 minutes.', blockedUntil: this.loginBlockedUntil, remainingSeconds: 300 }));
         } else {
           console.log(`[SECURITY] Failed login attempt ${this.failedLoginAttempts}/5`);
           res.writeHead(401, { 'Content-Type': 'application/json' });
-          res.end(JSON.stringify({
-            error: `Invalid password. ${attemptsRemaining} attempt(s) remaining.`,
-            attemptsRemaining: attemptsRemaining
-          }));
+          res.end(JSON.stringify({ error: `Invalid password. ${attemptsRemaining} attempt(s) remaining.`, attemptsRemaining }));
         }
       }
     } catch (error) {
@@ -823,10 +864,7 @@ class ProxyServer {
       const envPath = path.join(process.cwd(), '.env');
       const envContent = fs.readFileSync(envPath, 'utf8');
       const envVars = this.config.parseEnvFile(envContent);
-
-      // Don't send the admin password
       delete envVars.ADMIN_PASSWORD;
-
       res.writeHead(200, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify(envVars));
     } catch (error) {
@@ -838,7 +876,6 @@ class ProxyServer {
     try {
       const envPath = path.join(process.cwd(), '.env');
       const envContent = fs.readFileSync(envPath, 'utf8');
-
       res.writeHead(200, { 'Content-Type': 'text/plain' });
       res.end(envContent);
     } catch (error) {
@@ -857,33 +894,20 @@ class ProxyServer {
     }
   }
   
-  
   async handleUpdateEnvVars(res, body) {
     try {
       const envVars = JSON.parse(body);
       const envPath = path.join(process.cwd(), '.env');
-
-      // Read current env to preserve admin password and disabled states
       const currentEnvContent = fs.readFileSync(envPath, 'utf8');
       const currentEnvVars = this.config.parseEnvFile(currentEnvContent);
-
-      // Merge with new vars but preserve admin password
       const finalEnvVars = { ...envVars };
-      if (currentEnvVars.ADMIN_PASSWORD) {
-        finalEnvVars.ADMIN_PASSWORD = currentEnvVars.ADMIN_PASSWORD;
-      }
-
-      // Preserve _DISABLED entries from current env if not in new vars
+      if (currentEnvVars.ADMIN_PASSWORD) finalEnvVars.ADMIN_PASSWORD = currentEnvVars.ADMIN_PASSWORD;
       for (const [key, value] of Object.entries(currentEnvVars)) {
-        if (key.endsWith('_DISABLED') && !(key in finalEnvVars)) {
-          finalEnvVars[key] = value;
-        }
+        if (key.endsWith('_DISABLED') && !(key in finalEnvVars)) finalEnvVars[key] = value;
       }
-
       this.writeEnvFile(finalEnvVars);
       this.config.loadConfig();
       this.reinitializeClients();
-
       res.writeHead(200, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ success: true }));
     } catch (error) {
@@ -895,15 +919,11 @@ class ProxyServer {
     try {
       const { apiType, apiKey, baseUrl } = JSON.parse(body);
       let testResult = { success: false, error: 'Unknown API type' };
-      
       if (apiType === 'gemini') {
-        // Test Gemini API key with custom base URL if provided
         testResult = await this.testGeminiKey(apiKey, baseUrl);
       } else if (apiType === 'openai') {
-        // Test OpenAI API key with custom base URL if provided
         testResult = await this.testOpenaiKey(apiKey, baseUrl);
       }
-      
       res.writeHead(200, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify(testResult));
     } catch (error) {
@@ -915,54 +935,27 @@ class ProxyServer {
     const testId = Math.random().toString(36).substring(2, 11);
     const testBaseUrl = baseUrl || 'https://generativelanguage.googleapis.com/v1';
     const startTime = Date.now();
-    
-    // Determine the correct path based on base URL
     let testPath = '/models';
     let fullUrl;
-    
     if (testBaseUrl.includes('/v1') || testBaseUrl.includes('/v1beta')) {
-      // Base URL already includes version, just append models
       fullUrl = `${testBaseUrl.endsWith('/') ? testBaseUrl.slice(0, -1) : testBaseUrl}/models?key=${apiKey}`;
     } else {
-      // Base URL doesn't include version, add /v1/models
       fullUrl = `${testBaseUrl.endsWith('/') ? testBaseUrl.slice(0, -1) : testBaseUrl}/v1/models?key=${apiKey}`;
       testPath = '/v1/models';
     }
-    
     try {
       const testResponse = await fetch(fullUrl);
       const responseText = await testResponse.text();
       const contentType = testResponse.headers.get('content-type') || 'unknown';
       const responseTime = Date.now() - startTime;
-      
-      // Store response data for viewing
-      this.storeResponseData(testId, {
-        method: 'GET',
-        endpoint: testPath,
-        apiType: 'Gemini',
-        status: testResponse.status,
-        statusText: testResponse.statusText,
-        contentType: contentType,
-        responseData: responseText,
-        requestBody: null
-      });
-      
-      // Log with structured format
+      this.storeResponseData(testId, { method: 'GET', endpoint: testPath, apiType: 'Gemini', status: testResponse.status, statusText: testResponse.statusText, contentType, responseData: responseText, requestBody: null });
       const error = !testResponse.ok ? `API test failed: ${testResponse.status} ${testResponse.statusText}` : null;
       this.logApiRequest(testId, 'GET', testPath, 'gemini', testResponse.status, responseTime, error, 'admin-test');
-      
-      console.log(`[TEST-${testId}] GET ${testPath} (Gemini) → ${testResponse.status} ${testResponse.statusText} | ${contentType} ${responseText.length}b`);
-      
-      return { 
-        success: testResponse.ok, 
-        error: error
-      };
+      console.log(`[TEST-${testId}] GET ${testPath} (Gemini) → ${testResponse.status} ${testResponse.statusText}`);
+      return { success: testResponse.ok, error };
     } catch (error) {
       const responseTime = Date.now() - startTime;
-      
-      console.log(`[TEST-${testId}] GET ${testPath} (Gemini) → ERROR: ${error.message}`);
       this.logApiRequest(testId, 'GET', testPath, 'gemini', null, responseTime, error.message, 'admin-test');
-      
       return { success: false, error: error.message };
     }
   }
@@ -971,113 +964,45 @@ class ProxyServer {
     const testId = Math.random().toString(36).substring(2, 11);
     const testBaseUrl = baseUrl || 'https://api.openai.com/v1';
     const startTime = Date.now();
-    
-    // Construct the full URL - just append /models to the base URL
     const fullUrl = `${testBaseUrl.endsWith('/') ? testBaseUrl.slice(0, -1) : testBaseUrl}/models`;
-    
-    // Determine display path for logging
     let testPath = '/models';
-    if (testBaseUrl.includes('/openai/v1')) {
-      testPath = '/openai/v1/models';
-    } else if (testBaseUrl.includes('/v1')) {
-      testPath = '/v1/models';
-    }
-    
+    if (testBaseUrl.includes('/openai/v1')) testPath = '/openai/v1/models';
+    else if (testBaseUrl.includes('/v1')) testPath = '/v1/models';
     try {
-      const testResponse = await fetch(fullUrl, {
-        headers: { 'Authorization': `Bearer ${apiKey}` }
-      });
-      
+      const testResponse = await fetch(fullUrl, { headers: { 'Authorization': `Bearer ${apiKey}` } });
       const responseText = await testResponse.text();
       const contentType = testResponse.headers.get('content-type') || 'unknown';
       const responseTime = Date.now() - startTime;
-      
-      // Store response data for viewing
-      this.storeResponseData(testId, {
-        method: 'GET',
-        endpoint: testPath,
-        apiType: 'OpenAI',
-        status: testResponse.status,
-        statusText: testResponse.statusText,
-        contentType: contentType,
-        responseData: responseText,
-        requestBody: null
-      });
-      
-      // Log with structured format
+      this.storeResponseData(testId, { method: 'GET', endpoint: testPath, apiType: 'OpenAI', status: testResponse.status, statusText: testResponse.statusText, contentType, responseData: responseText, requestBody: null });
       const error = !testResponse.ok ? `API test failed: ${testResponse.status} ${testResponse.statusText}` : null;
       this.logApiRequest(testId, 'GET', testPath, 'openai', testResponse.status, responseTime, error, 'admin-test');
-      
-      console.log(`[TEST-${testId}] GET ${testPath} (OpenAI) → ${testResponse.status} ${testResponse.statusText} | ${contentType} ${responseText.length}b`);
-      
-      return { 
-        success: testResponse.ok, 
-        error: error
-      };
+      console.log(`[TEST-${testId}] GET ${testPath} (OpenAI) → ${testResponse.status} ${testResponse.statusText}`);
+      return { success: testResponse.ok, error };
     } catch (error) {
       const responseTime = Date.now() - startTime;
-      
-      console.log(`[TEST-${testId}] GET ${testPath} (OpenAI) → ERROR: ${error.message}`);
       this.logApiRequest(testId, 'GET', testPath, 'openai', null, responseTime, error.message, 'admin-test');
-      
       return { success: false, error: error.message };
     }
   }
   
   async handleGetLogs(res) {
     try {
-      // Return logs from memory buffer only (last 100 entries)
       const recentLogs = this.logBuffer.slice(-100).map(log => {
-        // Handle both old string format and new object format
         if (typeof log === 'string') {
-          // Parse old string format: "2024-01-15T10:30:45.123Z [REQ-abc123] POST /endpoint"
           const match = log.match(/^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z)\s+(.*)$/);
-          if (match) {
-            return {
-              timestamp: match[1],
-              requestId: 'legacy',
-              method: 'UNKNOWN',
-              endpoint: 'unknown',
-              provider: 'unknown',
-              status: null,
-              responseTime: null,
-              error: null,
-              clientIp: null,
-              message: match[2] // Keep original message for backward compatibility
-            };
-          }
-          return {
-            timestamp: new Date().toISOString(),
-            requestId: 'unknown',
-            method: 'UNKNOWN',
-            endpoint: 'unknown',
-            provider: 'unknown',
-            status: null,
-            responseTime: null,
-            error: null,
-            clientIp: null,
-            message: log
-          };
+          if (match) return { timestamp: match[1], requestId: 'legacy', method: 'UNKNOWN', endpoint: 'unknown', provider: 'unknown', status: null, responseTime: null, error: null, clientIp: null, message: match[2] };
+          return { timestamp: new Date().toISOString(), requestId: 'unknown', method: 'UNKNOWN', endpoint: 'unknown', provider: 'unknown', status: null, responseTime: null, error: null, clientIp: null, message: log };
         }
-        return log; // Already an object
+        return log;
       });
-      
       res.writeHead(200, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ 
-        logs: recentLogs,
-        totalEntries: recentLogs.length,
-        format: 'json' // Indicate the new format
-      }));
+      res.end(JSON.stringify({ logs: recentLogs, totalEntries: recentLogs.length, format: 'json' }));
     } catch (error) {
       console.error('Failed to get logs:', error.message);
       res.writeHead(500, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ 
-        error: 'Failed to retrieve logs',
-        logs: []
-      }));
+      res.end(JSON.stringify({ error: 'Failed to retrieve logs', logs: [] }));
     }
   }
-  
   
   logApiRequest(requestId, method, endpoint, provider, status = null, responseTime = null, error = null, clientIp = null, keyInfo = null) {
     const logEntry = {
@@ -1086,56 +1011,18 @@ class ProxyServer {
       method: method || 'UNKNOWN',
       endpoint: endpoint || 'unknown',
       provider: provider || 'unknown',
-      status: status,
-      responseTime: responseTime,
-      error: error,
-      clientIp: clientIp,
+      status,
+      responseTime,
+      error,
+      clientIp,
       keyUsed: keyInfo ? keyInfo.keyUsed : null,
       failedKeys: keyInfo ? keyInfo.failedKeys : []
     };
-    
-    // Add to buffer (keep last 100 entries in RAM only)
     this.logBuffer.push(logEntry);
-    if (this.logBuffer.length > 100) {
-      this.logBuffer.shift();
-    }
+    if (this.logBuffer.length > 100) this.logBuffer.shift();
   }
-
-  
-  // Helper method for backward compatibility - converts old string calls to new structured calls
-  logApiRequestLegacy(message) {
-    // Parse message to extract structured data
-    const timestamp = new Date().toISOString();
-    
-    // Extract request ID if present
-    const reqIdMatch = message.match(/\[REQ-([^\]]+)\]/);
-    const requestId = reqIdMatch ? reqIdMatch[1] : 'unknown';
-    
-    // Extract method and endpoint
-    const methodMatch = message.match(/(GET|POST|PUT|DELETE|PATCH)\s+([^\s]+)/);
-    const method = methodMatch ? methodMatch[1] : 'UNKNOWN';
-    const endpoint = methodMatch ? methodMatch[2] : 'unknown';
-    
-    // Extract provider
-    let provider = 'unknown';
-    if (message.includes('OpenAI')) provider = 'openai';
-    else if (message.includes('Gemini')) provider = 'gemini';
-    else if (message.includes('groq')) provider = 'groq';
-    else if (message.includes('openrouter')) provider = 'openrouter';
-    
-    // Extract status code
-    const statusMatch = message.match(/(\d{3})\s+/);
-    const status = statusMatch ? parseInt(statusMatch[1]) : null;
-    
-    // Extract error information
-    const error = message.includes('error') || message.includes('Error') || status >= 400 ? message : null;
-    
-    this.logApiRequest(requestId, method, endpoint, provider, status, null, error, null);
-  }
-
 
   storeResponseData(testId, responseData) {
-    // Store response data for viewing (keep last 100 responses)
     this.responseStorage.set(testId, responseData);
     if (this.responseStorage.size > 100) {
       const firstKey = this.responseStorage.keys().next().value;
@@ -1143,16 +1030,14 @@ class ProxyServer {
     }
   }
 
-  async handleGetResponse(res, path) {
+  async handleGetResponse(res, urlPath) {
     try {
-      const testId = path.split('/').pop(); // Extract testId from path
+      const testId = urlPath.split('/').pop();
       const responseData = this.responseStorage.get(testId);
-      
       if (!responseData) {
         this.sendError(res, 404, 'Response not found');
         return;
       }
-      
       res.writeHead(200, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify(responseData));
     } catch (error) {
@@ -1160,10 +1045,6 @@ class ProxyServer {
     }
   }
 
-  /**
-   * Reorder keys for a provider
-   * Body: { apiType: string, providerName: string, keys: string[] }
-   */
   async handleReorderKeys(res, body) {
     try {
       const { apiType, providerName, keys } = JSON.parse(body);
@@ -1171,26 +1052,18 @@ class ProxyServer {
         this.sendError(res, 400, 'Missing apiType, providerName, or keys array');
         return;
       }
-
       const envPath = path.join(process.cwd(), '.env');
       const envContent = fs.readFileSync(envPath, 'utf8');
       const envVars = this.config.parseEnvFile(envContent);
-
       const envKey = `${apiType.toUpperCase()}_${providerName.toUpperCase()}_API_KEYS`;
-
-      // Preserve disabled state: build new key string with ~ prefix for disabled keys
       const currentValue = envVars[envKey] || '';
       const currentParsed = this.config.parseApiKeysWithState(currentValue);
       const disabledSet = new Set(currentParsed.allKeys.filter(k => k.disabled).map(k => k.key));
-
       const newKeysStr = keys.map(k => disabledSet.has(k) ? `~${k}` : k).join(',');
       envVars[envKey] = newKeysStr;
-
-      // Write updated env
       this.writeEnvFile(envVars);
       this.config.loadConfig();
       this.reinitializeClients();
-
       res.writeHead(200, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ success: true }));
     } catch (error) {
@@ -1198,34 +1071,15 @@ class ProxyServer {
     }
   }
 
-  /**
-   * Get key usage statistics for all providers
-   */
   async handleGetKeyUsage(res) {
     try {
       const usage = {};
-
-      const mapStats = (stats) => stats.map(s => ({
-        key: s.key,
-        fullKey: s.fullKey,
-        usageCount: s.usageCount
-      }));
-
-      // Get usage from provider clients
+      const mapStats = (stats) => stats.map(s => ({ key: s.key, fullKey: s.fullKey, usageCount: s.usageCount }));
       for (const [providerName, client] of this.providerClients.entries()) {
-        if (client.keyRotator) {
-          usage[providerName] = mapStats(client.keyRotator.getKeyUsageStats());
-        }
+        if (client.keyRotator) usage[providerName] = mapStats(client.keyRotator.getKeyUsageStats());
       }
-
-      // Legacy clients
-      if (this.geminiClient && this.geminiClient.keyRotator && !usage['gemini']) {
-        usage['gemini'] = mapStats(this.geminiClient.keyRotator.getKeyUsageStats());
-      }
-      if (this.openaiClient && this.openaiClient.keyRotator && !usage['openai']) {
-        usage['openai'] = mapStats(this.openaiClient.keyRotator.getKeyUsageStats());
-      }
-
+      if (this.geminiClient && this.geminiClient.keyRotator && !usage['gemini']) usage['gemini'] = mapStats(this.geminiClient.keyRotator.getKeyUsageStats());
+      if (this.openaiClient && this.openaiClient.keyRotator && !usage['openai']) usage['openai'] = mapStats(this.openaiClient.keyRotator.getKeyUsageStats());
       res.writeHead(200, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify(usage));
     } catch (error) {
@@ -1233,10 +1087,6 @@ class ProxyServer {
     }
   }
 
-  /**
-   * Toggle a key's disabled state
-   * Body: { apiType: string, providerName: string, keyIndex: number, disabled: boolean }
-   */
   async handleToggleKey(res, body) {
     try {
       const { apiType, providerName, keyIndex, disabled } = JSON.parse(body);
@@ -1244,30 +1094,22 @@ class ProxyServer {
         this.sendError(res, 400, 'Missing apiType, providerName, or keyIndex');
         return;
       }
-
       const envPath = path.join(process.cwd(), '.env');
       const envContent = fs.readFileSync(envPath, 'utf8');
       const envVars = this.config.parseEnvFile(envContent);
-
       const envKey = `${apiType.toUpperCase()}_${providerName.toUpperCase()}_API_KEYS`;
       const currentValue = envVars[envKey] || '';
       const parsed = this.config.parseApiKeysWithState(currentValue);
-
       if (keyIndex < 0 || keyIndex >= parsed.allKeys.length) {
         this.sendError(res, 400, 'Invalid key index');
         return;
       }
-
       parsed.allKeys[keyIndex].disabled = disabled;
-
-      // Rebuild key string
       const newKeysStr = parsed.allKeys.map(k => k.disabled ? `~${k.key}` : k.key).join(',');
       envVars[envKey] = newKeysStr;
-
       this.writeEnvFile(envVars);
       this.config.loadConfig();
       this.reinitializeClients();
-
       res.writeHead(200, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ success: true }));
     } catch (error) {
@@ -1275,10 +1117,6 @@ class ProxyServer {
     }
   }
 
-  /**
-   * Toggle a provider's disabled state
-   * Body: { apiType: string, providerName: string, disabled: boolean }
-   */
   async handleToggleProvider(res, body) {
     try {
       const { apiType, providerName, disabled } = JSON.parse(body);
@@ -1286,23 +1124,15 @@ class ProxyServer {
         this.sendError(res, 400, 'Missing apiType or providerName');
         return;
       }
-
       const envPath = path.join(process.cwd(), '.env');
       const envContent = fs.readFileSync(envPath, 'utf8');
       const envVars = this.config.parseEnvFile(envContent);
-
       const envKey = `${apiType.toUpperCase()}_${providerName.toUpperCase()}_DISABLED`;
-
-      if (disabled) {
-        envVars[envKey] = 'true';
-      } else {
-        delete envVars[envKey];
-      }
-
+      if (disabled) envVars[envKey] = 'true';
+      else delete envVars[envKey];
       this.writeEnvFile(envVars);
       this.config.loadConfig();
       this.reinitializeClients();
-
       res.writeHead(200, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ success: true }));
     } catch (error) {
@@ -1310,12 +1140,8 @@ class ProxyServer {
     }
   }
 
-  /**
-   * Write env vars back to .env file (shared helper)
-   */
   writeEnvFile(envVars) {
     const envPath = path.join(process.cwd(), '.env');
-
     let envContent = '# API Key Rotator Configuration\n';
     envContent += `# Last updated: ${new Date().toISOString()}\n\n`;
 
@@ -1325,7 +1151,6 @@ class ProxyServer {
 
     Object.entries(envVars).forEach(([key, value]) => {
       if (key === 'BASE_URL' && (!value || value.trim() === '')) return;
-
       if (key === 'PORT' || key === 'ADMIN_PASSWORD') {
         basicConfig[key] = value;
       } else if (key.endsWith('_API_KEYS') || key.endsWith('_BASE_URL') || key.endsWith('_ACCESS_KEY') || key.endsWith('_DEFAULT_MODEL') || key.endsWith('_MODEL_HISTORY') || key.endsWith('_DISABLED')) {
@@ -1335,11 +1160,7 @@ class ProxyServer {
           const provName = match[2];
           const keyType = match[3];
           const providerKey = `${apiType}_${provName}`;
-
-          if (!providers[providerKey]) {
-            providers[providerKey] = { apiType, providerName: provName, keys: '', baseUrl: '', accessKey: '', defaultModel: '', modelHistory: '', disabled: '' };
-          }
-
+          if (!providers[providerKey]) providers[providerKey] = { apiType, providerName: provName, keys: '', baseUrl: '', accessKey: '', defaultModel: '', modelHistory: '', disabled: '' };
           if (keyType === 'API_KEYS') providers[providerKey].keys = value;
           else if (keyType === 'BASE_URL') providers[providerKey].baseUrl = value;
           else if (keyType === 'ACCESS_KEY') providers[providerKey].accessKey = value;
@@ -1356,9 +1177,7 @@ class ProxyServer {
 
     if (Object.keys(basicConfig).length > 0) {
       envContent += '# Basic Configuration\n';
-      for (const [key, value] of Object.entries(basicConfig)) {
-        envContent += `${key}=${value}\n`;
-      }
+      for (const [key, value] of Object.entries(basicConfig)) envContent += `${key}=${value}\n`;
       envContent += '\n';
     }
 
@@ -1384,9 +1203,7 @@ class ProxyServer {
 
     if (Object.keys(otherConfig).length > 0) {
       envContent += '# Additional Configuration\n';
-      for (const [key, value] of Object.entries(otherConfig)) {
-        envContent += `${key}=${value}\n`;
-      }
+      for (const [key, value] of Object.entries(otherConfig)) envContent += `${key}=${value}\n`;
     }
 
     fs.writeFileSync(envPath, envContent);
@@ -1403,42 +1220,28 @@ class ProxyServer {
     }
   }
 
-  /**
-   * Reinitialize API clients with updated configuration
-   * Called after environment variables are updated via admin panel
-   */
   reinitializeClients() {
     console.log('[SERVER] Reinitializing API clients with updated configuration...');
-    
-    // Clear all provider clients
     this.providerClients.clear();
-    
-    // Reinitialize legacy clients for backward compatibility
     if (this.config.hasGeminiKeys()) {
       const geminiKeyRotator = new this.KeyRotator(this.config.getGeminiApiKeys(), 'gemini');
       this.geminiClient = new this.GeminiClient(geminiKeyRotator, this.config.getGeminiBaseUrl());
       console.log('[SERVER] Legacy Gemini client reinitialized');
     } else {
       this.geminiClient = null;
-      console.log('[SERVER] Legacy Gemini client disabled (no keys available)');
     }
-    
     if (this.config.hasOpenaiKeys()) {
       const openaiKeyRotator = new this.KeyRotator(this.config.getOpenaiApiKeys(), 'openai');
       this.openaiClient = new this.OpenAIClient(openaiKeyRotator, this.config.getOpenaiBaseUrl());
       console.log('[SERVER] Legacy OpenAI client reinitialized');
     } else {
       this.openaiClient = null;
-      console.log('[SERVER] Legacy OpenAI client disabled (no keys available)');
     }
-    
     console.log(`[SERVER] ${this.config.getProviders().size} providers available for dynamic initialization`);
   }
 
   stop() {
-    if (this.server) {
-      this.server.close();
-    }
+    if (this.server) this.server.close();
   }
 }
 
